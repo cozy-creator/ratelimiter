@@ -8,9 +8,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"ratelimiter/store"
+	"github.com/cozy-creator/ratelimiter/store"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,19 +26,61 @@ type RateLimiter struct {
 	store       *store.Store
 	capacity    int64
 	refillRate  float64 // tokens per second
+	apiKeys     map[string]bool
 }
 
-func NewRateLimiter(bindAddr string, knownNodes []string, capacity int64, refillRate float64) (*RateLimiter, error) {
+func NewRateLimiter(bindAddr string, knownNodes []string, capacity int64, refillRate float64, apiKeys []string) (*RateLimiter, error) {
 	s, err := store.NewStore(bindAddr, knownNodes, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+
+	// Convert API keys to a map for O(1) lookup
+	apiKeyMap := make(map[string]bool)
+	for _, key := range apiKeys {
+		apiKeyMap[key] = true
 	}
 
 	return &RateLimiter{
 		store:      s,
 		capacity:   capacity,
 		refillRate: refillRate,
+		apiKeys:    apiKeyMap,
 	}, nil
+}
+
+// validateAPIKey checks if the provided API key is valid
+func (rl *RateLimiter) validateAPIKey(key string) bool {
+	return rl.apiKeys[key]
+}
+
+// authMiddleware validates the API key in the Authorization header
+func (rl *RateLimiter) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if auth == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing API key"})
+			c.Abort()
+			return
+		}
+
+		// Extract API key from "Bearer <api-key>" format
+		parts := strings.Split(auth, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format"})
+			c.Abort()
+			return
+		}
+
+		apiKey := parts[1]
+		if !rl.validateAPIKey(apiKey) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid API key"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
 }
 
 func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens int64) (bool, error) {
@@ -102,13 +145,22 @@ func main() {
 		knownNodes = []string{peers}
 	}
 
+	// Get API keys from environment variable
+	apiKeys := strings.Split(os.Getenv("API_KEYS"), ",")
+	if len(apiKeys) == 0 || (len(apiKeys) == 1 && apiKeys[0] == "") {
+		log.Fatal("API_KEYS environment variable must be set")
+	}
+
 	// Create rate limiter with 100 tokens capacity, refilling at 10 tokens per second
-	limiter, err := NewRateLimiter(bindAddr, knownNodes, 100, 10)
+	limiter, err := NewRateLimiter(bindAddr, knownNodes, 100, 10, apiKeys)
 	if err != nil {
 		log.Fatalf("Failed to create rate limiter: %v", err)
 	}
 
 	r := gin.Default()
+
+	// Apply authentication middleware to all routes
+	r.Use(limiter.authMiddleware())
 
 	r.POST("/consume", func(c *gin.Context) {
 		key := c.Query("key")

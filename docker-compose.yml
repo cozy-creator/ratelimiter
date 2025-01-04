@@ -8,6 +8,7 @@ services:
     environment:
       - BIND_ADDR=0.0.0.0:7946
       - PORT=8080
+      - API_KEYS=key1,key2,key3
     ports:
       - "8080:8080"
       - "7946:7946"
@@ -22,6 +23,7 @@ services:
       - BIND_ADDR=0.0.0.0:7946
       - PORT=8081
       - KNOWN_PEERS=ratelimiter1:7946
+      - API_KEYS=key1,key2,key3
     ports:
       - "8081:8081"
       - "7947:7946"
@@ -38,6 +40,7 @@ services:
       - BIND_ADDR=0.0.0.0:7946
       - PORT=8082
       - KNOWN_PEERS=ratelimiter1:7946
+      - API_KEYS=key1,key2,key3
     ports:
       - "8082:8082"
       - "7948:7946"
