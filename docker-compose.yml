@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  ratelimiter1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - BIND_ADDR=0.0.0.0:7946
+      - PORT=8080
+    ports:
+      - "8080:8080"
+      - "7946:7946"
+    networks:
+      - ratelimiter-net
+
+  ratelimiter2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - BIND_ADDR=0.0.0.0:7946
+      - PORT=8081
+      - KNOWN_PEERS=ratelimiter1:7946
+    ports:
+      - "8081:8081"
+      - "7947:7946"
+    depends_on:
+      - ratelimiter1
+    networks:
+      - ratelimiter-net
+
+  ratelimiter3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - BIND_ADDR=0.0.0.0:7946
+      - PORT=8082
+      - KNOWN_PEERS=ratelimiter1:7946
+    ports:
+      - "8082:8082"
+      - "7948:7946"
+    depends_on:
+      - ratelimiter1
+    networks:
+      - ratelimiter-net
+
+networks:
+  ratelimiter-net:
+    driver: bridge 
