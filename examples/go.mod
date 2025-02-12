@@ -3,7 +3,7 @@ module example
 go 1.23
 
 require (
-	github.com/cozy-creator/rate-limiter v0.0.0
+	github.com/cozy-creator/ratelimiter v0.0.0
 	github.com/google/uuid v1.6.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -24,4 +24,4 @@ require (
 	mellium.im/sasl v0.3.2 // indirect
 )
 
-replace github.com/cozy-creator/rate-limiter => ../
+replace github.com/cozy-creator/ratelimiter => ../

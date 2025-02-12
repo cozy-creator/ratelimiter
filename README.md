@@ -1,72 +1,32 @@
-# Rate Limiter
+### Rate Limiter
 
-A flexible rate limiting library that supports multiple rate limiting strategies and usage-based billing.
+Create tiered rate-limiting plans for your users, just like OpenAI does. Metering usage is especially important for AI services, whose backends are quite expensive.
 
-## Features
+First, you define usage plans; these are limits applied to each endpoint, such as 10 requests per minute + 200 requests per day + 2_000 tokens per minute. Then you assign plans to users.
 
-- Multiple rate limiting strategies:
-  - Sliding Window (request or token-based)
-  - Fixed Window (request or token-based)
-  - Token Bucket (request or token-based)
-  - Concurrent Requests Limiting
-- Usage-based billing with credits system
-- Plan-based rate limiting policies
-- High performance with Redis-based rate limiting
-- Persistent storage with PostgreSQL
-- In-memory caching for plan definitions
-- Post-request token and credit consumption
-
-## Requirements
+### Requirements
 
 - Go 1.23 or higher
-- Docker and Docker Compose
-- PostgreSQL 12 or higher (provided via Docker)
-- Redis 6 or higher (provided via Docker)
+- Postgres instance
+- Redis-compatible key-value store
 
-## Local Development Setup
+We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis kinda sucks though, but you can use any key-value store that has a Redis-compatible API; we recommend (microsoft/Garnet)[https://github.com/microsoft/garnet] instead.
 
-1. Create a `docker-compose.yml` file in your project root:
+### Deploy locally
 
-```yaml
-version: '3.8'
-services:
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ratelimiter
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --save 60 1 --loglevel warning
-
-volumes:
-  postgres_data:
-  redis_data:
-```
-
-2. Start the services:
+1. In this repo's root, start the postgres + docker by running:
 
 ```bash
 docker-compose up -d
 ```
 
-3. Install the library:
+2. Install the library:
 
 ```bash
-go get github.com/cozy-creator/rate-limiter
+go get github.com/cozy-creator/ratelimiter
 ```
 
-4. Run database migrations:
+3. Run database migrations:
 
 ```bash
 go run cmd/migrate/main.go
@@ -74,7 +34,7 @@ go run cmd/migrate/main.go
 
 ## Usage Examples
 
-### Basic Setup
+### Construct the client
 
 ```go
 package main
@@ -82,11 +42,11 @@ package main
 import (
     "context"
     "log"
-    ratelimiter "github.com/cozy-creator/rate-limiter"
+    ratelimiter "github.com/cozy-creator/ratelimiter"
 )
 
 func main() {
-    // Create rate limiter config
+    // Specify database locations
     cfg := ratelimiter.Config{
         PostgresDSN:   "postgres://postgres:postgres@localhost:5432/ratelimiter?sslmode=disable",
         RedisAddr:     "localhost:6379",
@@ -141,8 +101,8 @@ allowed, err := client.AttemptRequest(
     "request-123",
     "user-456",
     "api/v1/chat",
-    ratelimiter.WithTokens(10),    // Initial token estimate
-    ratelimiter.WithCredits(5),    // Initial credit estimate
+    ratelimiter.WithTokens(10),    // Deduct tokens
+    ratelimiter.WithCredits(5),    // Deduct credits
 )
 if err != nil {
     log.Fatalf("Error: %v", err)
@@ -169,189 +129,16 @@ if result != nil && result.RemainingDue > 0 {
 }
 ```
 
-### Example Policy Configuration
-
-```sql
--- Insert a plan with rate limits
-INSERT INTO ratelimit.plan (name, policies, is_default) VALUES (
-    'basic_plan',
-    -- MessagePack encoded policies for endpoints
-    '\x82a9api/v1/chat82ac sliding_windows91a7window1a601a5limit1a64a8unit_kind a7request ab token_buckets91a8bucket_size1a632a8refill_rate1a65a8unit_kind a5token af max_concurrent1a05',
-    true
-);
-
--- Assign plan to account
-INSERT INTO ratelimit.account (plan_id) VALUES ('plan-uuid-here');
-```
-
-This creates a plan with:
-- Sliding window: 100 requests per minute
-- Token bucket: 50 tokens capacity, refilling at 5 tokens/second
-- Maximum 5 concurrent requests
-
-### Policy Types
+### Limiter Policies
 
 Each endpoint can have multiple limiters of different types:
 - `RequestUnit`: Counts each request as 1 unit (automatically applied to every request)
 - `TokenUnit`: Counts based on token consumption (specified via WithTokens)
-- Concurrent requests are always counted per-request
-
-## Plan Configuration
-
-Plans can be defined either programmatically using Go structs or via YAML configuration files.
-
-### Endpoint Access Control
-
-Plans explicitly define which endpoints an account can access. If an endpoint is not defined in a plan's policies:
-- The account will be denied access to that endpoint
-- `AttemptRequest` will return an error: "no access to endpoint: {endpoint_name}"
-- This provides a simple but effective access control mechanism
-
-For example, in this plan only the chat API is accessible:
-```yaml
-plans:
-  basic_plan:
-    name: "Basic Plan"
-    endpoints:
-      "api/v1/chat":     # This endpoint is accessible
-        sliding_windows:
-          - window: 60s
-            limit: 100
-            unit_kind: request
-      # api/v1/images is not defined, so it's not accessible
-```
-
-To grant access to a new endpoint, you must explicitly define its policy in the plan:
-```yaml
-plans:
-  premium_plan:
-    name: "Premium Plan"
-    endpoints:
-      "api/v1/chat":     # Chat API is accessible
-        sliding_windows:
-          - window: 60s
-            limit: 1000
-      "api/v1/images":   # Image API is now accessible too
-        fixed_windows:
-          - window: 3600s
-            limit: 1000
-```
-
-### Real-World Example: OpenAI-Style Rate Limits
-
-Here's an example implementing rate limits similar to OpenAI's API tiers:
-
-```yaml
-plans:
-  free_tier:
-    name: "Free Tier"
-    endpoints:
-      "v1/chat/completions":
-        sliding_windows:
-          - window: 60s      # RPM limit
-            limit: 3
-            unit_kind: request
-          - window: 3600s    # Hourly TPM limit
-            limit: 40000
-            unit_kind: token
-        token_buckets:
-          - bucket_size: 40000   # Token bucket for bursts
-            refill_rate: 11.11   # ~40k tokens per hour
-            unit_kind: token
-        max_concurrent: 1    # Free tier: 1 request at a time
-
-      "v1/images/generations":
-        fixed_windows:
-          - window: 60s
-            limit: 2         # 2 images per minute
-            unit_kind: request
-        max_concurrent: 1
-
-  pro_tier:
-    name: "Pro Tier"
-    endpoints:
-      "v1/chat/completions":
-        sliding_windows:
-          - window: 60s
-            limit: 60        # 60 RPM
-            unit_kind: request
-          - window: 3600s
-            limit: 200000    # 200k TPH
-            unit_kind: token
-        token_buckets:
-          - bucket_size: 200000
-            refill_rate: 55.56    # ~200k tokens per hour
-            unit_kind: token
-        max_concurrent: 5
-
-      "v1/images/generations":
-        fixed_windows:
-          - window: 60s
-            limit: 10        # 10 images per minute
-            unit_kind: request
-        max_concurrent: 3
-
-  enterprise_tier:
-    name: "Enterprise Tier"
-    endpoints:
-      "v1/chat/completions":
-        sliding_windows:
-          - window: 60s
-            limit: 10000     # 10k RPM
-            unit_kind: request
-          - window: 3600s
-            limit: 2000000   # 2M TPH
-            unit_kind: token
-        token_buckets:
-          - bucket_size: 2000000
-            refill_rate: 555.56   # ~2M tokens per hour
-            unit_kind: token
-        max_concurrent: 50
-
-      "v1/images/generations":
-        fixed_windows:
-          - window: 60s
-            limit: 100       # 100 images per minute
-            unit_kind: request
-        max_concurrent: 10
-
-      "v1/fine-tunes":      # Only available to enterprise tier
-        sliding_windows:
-          - window: 60s
-            limit: 10
-            unit_kind: request
-        max_concurrent: 2
-```
-
-This configuration implements:
-
-1. **Free Tier Limits**:
-   - Chat completions: 3 requests/minute, 40K tokens/hour
-   - Image generation: 2 images/minute
-   - Single concurrent request per endpoint
-   - No access to fine-tuning
-
-2. **Pro Tier Limits**:
-   - Chat completions: 60 requests/minute, 200K tokens/hour
-   - Image generation: 10 images/minute
-   - Multiple concurrent requests
-   - No access to fine-tuning
-
-3. **Enterprise Tier Limits**:
-   - Chat completions: 10K requests/minute, 2M tokens/hour
-   - Image generation: 100 images/minute
-   - High concurrency limits
-   - Access to fine-tuning endpoint
-
-Features demonstrated:
-- Multiple rate limit types per endpoint (RPM and TPH)
-- Token bucket for handling bursts
-- Concurrent request limits
-- Access control through endpoint availability
-- Mix of time windows (per-minute and per-hour limits)
-- Both request-based and token-based limits
+- Concurrent requests are always counted per-request, if a concurrency limit is specified
 
 ## Plan Management
+
+Plans can be defined either programmatically using Go structs or via YAML configuration files.
 
 The rate limiter supports flexible plan management through the admin package. Plans can be defined and managed in two ways:
 
@@ -361,47 +148,83 @@ Create a `plans.yaml` file to define your rate limiting plans:
 
 ```yaml
 plans:
-  free_plan:
-    name: "Free Plan"
+  free_tier:
+    name: "Free Tier"
     endpoints:
-      "api/v1/chat":
-        sliding_windows:
-          - window: 60s
-            limit: 100
-            unit_kind: request  # Count requests
-        token_buckets:
-          - bucket_size: 1000
-            refill_rate: 10
-            unit_kind: token    # Count tokens
-        max_concurrent: 5
-
-  premium_plan:
-    name: "Premium Plan"
-    endpoints:
-      "api/v1/chat":
-        sliding_windows:
-          - window: 60s
-            limit: 1000
+      "gtp-4o-mini":
+        fixed_windows:
+          - window: 60s      # Requests per minute
+            limit: 3
             unit_kind: request
-        token_buckets:
-          - bucket_size: 10000
-            refill_rate: 100
-            unit_kind: token
-        max_concurrent: 20
-
-  enterprise_plan:
-    name: "Enterprise Plan"
-    endpoints:
-      "api/v1/chat":
-        sliding_windows:
-          - window: 60s
-            limit: 10000
+          - window: 86_400s  # Requests per day
+            limit: 200
             unit_kind: request
-        token_buckets:
-          - bucket_size: 100000
-            refill_rate: 1000
+          - window: 60s     # Tokens per minute
+            limit: 40_000
             unit_kind: token
-        max_concurrent: 100
+
+      "dall-e-3":
+        fixed_windows:
+          - window: 60s   # 1 image per minute
+            limit: 1
+            unit_kind: token
+
+  tier_1:
+    name: "Tier 1"
+    endpoints:
+      "gtp-4o-mini":
+        fixed_windows:
+          - window: 60s
+            limit: 500
+            unit_kind: request
+          - window: 86_400s  # Requests per day
+            limit: 10_000
+            unit_kind: request
+          - window: 60s
+            limit: 200_000
+            unit_kind: token
+      
+      "o1-preview":
+        fixed_windows:
+          - window: 60s
+            limit: 500
+            unit_kind: request
+          - window: 60s
+            limit: 30_000
+            unit_kind: token
+
+      "dall-e-3":
+        fixed_windows:
+          - window: 60s   # 500 images per minute
+            limit: 500
+            unit_kind: token
+
+  tier_2:
+    name: "Tier 2"
+    endpoints:
+      "gtp-4o-mini":
+        fixed_windows:
+          - window: 60s
+            limit: 5_000
+            unit_kind: request
+          - window: 60s
+            limit: 2_000_000
+            unit_kind: token
+      
+      "o1-preview":
+        fixed_windows:
+          - window: 60s
+            limit: 5_000
+            unit_kind: request
+          - window: 60s
+            limit: 450_000
+            unit_kind: token
+
+      "dall-e-3":
+        fixed_windows:
+          - window: 60s   # 2,500 images per minute
+            limit: 2_500
+            unit_kind: token
 ```
 
 Load and apply the plans:
@@ -410,7 +233,7 @@ Load and apply the plans:
 import (
     "context"
     "log"
-    "github.com/cozy-creator/rate-limiter/admin"
+    "github.com/cozy-creator/ratelimiter/admin"
     "github.com/uptrace/bun"
 )
 
@@ -442,8 +265,8 @@ Plans can also be defined programmatically:
 ```go
 import (
     "time"
-    "github.com/cozy-creator/rate-limiter/admin"
-    "github.com/cozy-creator/rate-limiter/limiters"
+    "github.com/cozy-creator/ratelimiter/admin"
+    "github.com/cozy-creator/ratelimiter/limiters"
 )
 
 func definePlans(ctx context.Context, db *bun.DB) error {
@@ -530,44 +353,44 @@ The system maintains exactly one default plan at all times:
 - Use `SetDefaultPlan` to change the default plan
 - The default plan cannot be deleted while it's set as default
 - `GetDefaultPlan` always returns the current default plan
-- New accounts without a specified plan get the default plan automatically
+- Accounts without a specified plan get the default plan automatically (for example, if you just want one plan to apply to all non-logged in users, who are identified with just IP-addresses)
 
-```go
-    ctx := context.Background()
 
-    type Plans struct {
-        Plan1: {
-            Endpoint1: [
-                RateLimit: 1
-                ConcurrencyLimit: 1
-            ]
-        },
-        Plan2: {},
-        DefaultPlan: {}, // fallback if not specified by user
-    }
+### Endpoint Access Control
 
-    // Fetch plan information
-    plans, _ := cli.Get(ctx, "plans")
+Plans explicitly define which endpoints an account can access. If an endpoint is not defined in a plan's policies:
+- The account will be denied access to that endpoint
+- `AttemptRequest` will return an error: "no access to endpoint: {endpoint_name}"
+- This provides a simple but effective access control mechanism
 
-	planString, err = cli.Get(ctx, "plan:" + "userID")
-	if err != nil {
-		panic(err)
-	}
+For example, in this plan only the chat API is accessible:
+```yaml
+plans:
+  basic_plan:
+    name: "Basic Plan"
+    endpoints:
+      "api/v1/chat":     # This endpoint is accessible
+        sliding_windows:
+          - window: 60s
+            limit: 100
+            unit_kind: request
+      # api/v1/images is not defined, so it's not accessible
+```
 
-    policy = Plans[planString]
-
-    limiterState, _ = cli.Get(ctx, "limiterstate:" + "userID:" + "endpointID")
-
-    // check to see if the limiter state doesn't exist, and use the above if not to create
-    // a new limiter state here
-
-    allow := limiterState.CanUpdate(usage)
-    if !allow {
-        return false, nil
-    }
-
-    limiterState.update(usage)
-    err = cli.Set(ctx, "limiterstate:" + "userID:" + "endpointID", limiterState)
-
-    return true, nil
+To grant access to a new endpoint, you must explicitly define its policy in the plan:
+```yaml
+plans:
+  premium_plan:
+    name: "Premium Plan"
+    endpoints:
+      "api/v1/chat":     # Chat API is accessible
+        sliding_windows:
+          - window: 60s
+            limit: 200
+            unit_kind: request
+      "api/v1/images":   # Image API is now accessible too
+        fixed_windows:
+          - window: 3600s
+            limit: 100
+            unit_kind: request
 ```

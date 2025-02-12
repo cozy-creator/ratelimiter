@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	limiter "github.com/cozy-creator/rate-limiter"
-	"github.com/cozy-creator/rate-limiter/policy"
+	limiter "github.com/cozy-creator/ratelimiter"
+	"github.com/cozy-creator/ratelimiter/policy"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )

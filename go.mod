@@ -1,4 +1,4 @@
-module github.com/cozy-creator/rate-limiter
+module github.com/cozy-creator/ratelimiter
 
 go 1.23
 

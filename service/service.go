@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/rate-limiter/limiters"
-	"github.com/cozy-creator/rate-limiter/models"
+	"github.com/cozy-creator/ratelimiter/limiters"
+	"github.com/cozy-creator/ratelimiter/models"
 	"github.com/redis/go-redis/v9"
 	"github.com/uptrace/bun"
 	"github.com/vmihailenco/msgpack/v5"
