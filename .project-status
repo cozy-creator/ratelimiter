@@ -26,6 +26,8 @@ some of the stuff from postgres can be cached in memory, since it's redundant to
 
 ### Future
 
+[ ] Do we need to prefix table names with rate-limit? If we have our own schema?
+
 [ ] BUG: time to next window reset is calculated wrong. If it's 1 hour, it'll report like 1 hour + 2 mins, when the answer should be 2 mins. Claude doesn't get it.
 
 [ ] Try logging usage into clickhouse, to do usage-based billing.

@@ -2,11 +2,17 @@
 
 Create tiered rate-limiting plans for your users, just like OpenAI does. Metering usage is especially important for AI services, whose backends are quite expensive.
 
-First, you define usage plans; these are limits applied to each endpoint, such as 10 requests per minute + 200 requests per day + 2_000 tokens per minute. Then you assign plans to users.
+For each one of your endpoints you specify a policy, such as such as 10 requests per minute + 200 requests per day + 2_000 tokens per minute for the `gpt-4o` endpoint. All of the policies together are called a `plan` as in like, "premium-plan" or "free-plan".
 
-We only use fixed-window rate limits. You can specify whatever unit types you like in your policy: `gpu-second`, `token`, etc. and will ensure these limits are met. The default unit-type (if unspecified) is `request`.
+Then you assign plans to your users. You can assign default plans too, if you don't want to assign plans per user.
 
-We also support `credits`, which are meant to be pre-purchased balances (either funny-money or actual dollars) that your users need in order to use your API. These credits are called `quota blocks` in postgres, and they can have expiration dates.
+For simiplicity, we only use fixed-window rate limits. You can specify whatever unit types you like in your policy: `gpu-second`, `token`, `image`, etc., and a limit on how many of those a user can consume in a specified period of time (Example: 500 images per minute). The default unit-type (if unspecified) is just `request`.
+
+We also support limiting concurrent requests; i.e., a user can only have 5 jobs processing at a time.
+
+We also support `credits`, which are meant to be pre-purchased balances (either your own funny-money or actual dollars) that your users consume every time they use your API. We call credits granted to users `quota blocks` in postgres, and they can have expiration dates.
+
+We currently do not support logging of requests for usage-based billing, but that may come in the future.
 
 ### Requirements
 
@@ -37,7 +43,7 @@ go run cmd/migrate/main.go
 
 ## Usage Examples
 
-### Construct the client
+### Construct a ratelimiter client
 
 ```go
 package main
@@ -79,7 +85,7 @@ func main() {
 }
 ```
 
-### Basic Rate Limiting
+### Limit By Request Count
 
 ```go
 // Attempt a request (consumes 1 request unit by default)
@@ -110,7 +116,7 @@ if err != nil {
 }
 ```
 
-### Rate Limiting with Token and Credit Consumption
+### Limit By Tokens + Consume Credits
 
 ```go
 // Start request with initial consumption
@@ -165,12 +171,6 @@ if result.Remaining > 0 {
         result.Deducted, result.Requested)
 }
 ```
-
-### Limiter Policies
-
-Each endpoint can have multiple limiters of different types:
-- Fixed windows with various unit types (e.g., "request", "token", "gpu-second")
-- Concurrent request limits (optional)
 
 ## Plan and Account Management
 
