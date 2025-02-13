@@ -10,23 +10,23 @@ First, you define usage plans; these are limits applied to each endpoint, such a
 - Postgres instance
 - Redis-compatible key-value store
 
-We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis kinda sucks though, but you can use any key-value store that has a Redis-compatible API; we recommend (microsoft/Garnet)[https://github.com/microsoft/garnet] instead.
+We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis kinda sucks though, but you can use any key-value store that has a Redis-compatible API; we recommend (microsoft/Garnet)[https://github.com/microsoft/garnet] instead. Note that we use postgres-specific features in our tables, so Postgres can't be swapped out with another SQL database easily.
 
 ### Deploy locally
 
-1. In this repo's root, start the postgres + docker by running:
-
-```bash
-docker-compose up -d
-```
-
-2. Install the library:
+1. Add our golang library to your project:
 
 ```bash
 go get github.com/cozy-creator/ratelimiter
 ```
 
-3. Run database migrations:
+2. In this repo's root, start the postgres + docker by running:
+
+```bash
+docker-compose up -d
+```
+
+3. Run database migrations; this creates the initial tables in postgres that we'll use:
 
 ```bash
 go run cmd/migrate/main.go
@@ -46,22 +46,33 @@ import (
 )
 
 func main() {
-    // Specify database locations
-    cfg := ratelimiter.Config{
-        PostgresDSN:   "postgres://postgres:postgres@localhost:5432/ratelimiter?sslmode=disable",
-        RedisAddr:     "localhost:6379",
-        RedisPassword: "",
-        RedisDB:      0,
-    }
-
-    // Create rate limiter client
-    client, err := ratelimiter.NewClient(cfg)
+    // Create client with default configuration (localhost postgres and redis)
+    client, err := ratelimiter.NewClient()
     if err != nil {
         log.Fatalf("creating client: %v", err)
     }
     defer client.Close()
 
-    // Use the client...
+    // Or create with custom configuration using functional options
+    client, err = ratelimiter.NewClient(
+        ratelimiter.WithPostgresDSN("postgres://user:pass@host:5432/db"),
+        ratelimiter.WithRedisAddr("redis:6379"),
+        ratelimiter.WithRedisPassword("optional-password"),
+    )
+    if err != nil {
+        log.Fatalf("creating client: %v", err)
+    }
+    defer client.Close()
+
+    // Or reuse existing database clients
+    client, err = ratelimiter.NewClient(
+        ratelimiter.WithDBClient(existingDB),
+        ratelimiter.WithRedisClient(existingRedis),
+    )
+    if err != nil {
+        log.Fatalf("creating client: %v", err)
+    }
+    defer client.Close()
 }
 ```
 
@@ -101,8 +112,8 @@ allowed, err := client.AttemptRequest(
     "request-123",
     "user-456",
     "api/v1/chat",
-    ratelimiter.WithTokens(10),    // Deduct tokens
-    ratelimiter.WithCredits(5),    // Deduct credits
+    ratelimiter.DeductTokens(10),    // Deduct tokens
+    ratelimiter.DeductCredits(5),    // Deduct credits
 )
 if err != nil {
     log.Fatalf("Error: %v", err)
@@ -116,8 +127,8 @@ if !allowed {
 
 // End request with final consumption
 result, err := client.EndRequest(ctx, "request-123",
-    ratelimiter.WithTokens(100),  // Final token consumption
-    ratelimiter.WithCredits(15),  // Final credit consumption
+    ratelimiter.DeductTokens(100),  // Final token consumption
+    ratelimiter.DeductCredits(15),  // Final credit consumption
 )
 if err != nil {
     log.Printf("Error ending request: %v", err)
@@ -394,3 +405,40 @@ plans:
             limit: 100
             unit_kind: request
 ```
+
+## Rate Limit Information
+
+Applications can retrieve information about their current rate limits using the `GetRateLimitInfo` method. This is useful for displaying rate limit status to users or implementing client-side rate limiting.
+
+```go
+info, err := service.GetRateLimitInfo(ctx, accountID, "api/v1/chat")
+if err != nil {
+    log.Printf("Error getting rate limit info: %v", err)
+    return
+}
+
+fmt.Printf("Request Limits: %d/%d (resets in %v)\n", 
+    info.RequestRemaining, info.RequestLimit, info.RequestReset)
+fmt.Printf("Token Limits: %d/%d (resets in %v)\n",
+    info.TokenRemaining, info.TokenLimit, info.TokenReset)
+```
+
+The rate limit information includes:
+- `RequestLimit`: Maximum number of requests allowed in the current window
+- `RequestRemaining`: Number of requests remaining in the current window
+- `RequestReset`: Duration until the request counter resets
+- `TokenLimit`: Maximum number of tokens allowed in the current window
+- `TokenRemaining`: Number of tokens remaining in the current window
+- `TokenReset`: Duration until the token counter resets
+
+This information is also included in HTTP response headers when using the HTTP middleware:
+```
+X-RateLimit-Limit-Requests: 100
+X-RateLimit-Remaining-Requests: 95
+X-RateLimit-Reset-Requests: 55
+X-RateLimit-Limit-Tokens: 40000
+X-RateLimit-Remaining-Tokens: 38500
+X-RateLimit-Reset-Tokens: 3540
+```
+
+The reset times are provided in seconds. A value of 0 indicates that the limit has already reset.

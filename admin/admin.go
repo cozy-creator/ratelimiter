@@ -16,7 +16,6 @@ import (
 // Plan represents a rate limiting plan configuration
 type Plan struct {
 	Name      string                        `yaml:"name"`
-	IsDefault bool                          `yaml:"is_default"`
 	Endpoints map[string]limiters.Policy    `yaml:"endpoints"`
 }
 
@@ -52,21 +51,6 @@ func ApplyPlans(ctx context.Context, db *bun.DB, plans Plans) error {
 	}
 	defer tx.Rollback()
 
-	// Clear existing default plan if we're adding a new one
-	for _, plan := range plans {
-		if plan.IsDefault {
-			_, err = tx.NewUpdate().
-				Model((*models.Plan)(nil)).
-				Set("is_default = ?", false).
-				Where("is_default = ?", true).
-				Exec(ctx)
-			if err != nil {
-				return fmt.Errorf("clearing default plan: %w", err)
-			}
-			break
-		}
-	}
-
 	// Insert or update plans
 	for id, plan := range plans {
 		policies, err := msgpack.Marshal(plan.Endpoints)
@@ -76,15 +60,13 @@ func ApplyPlans(ctx context.Context, db *bun.DB, plans Plans) error {
 
 		_, err = tx.NewInsert().
 			Model(&models.Plan{
-				ID:        id,
-				Name:      plan.Name,
-				Policies:  policies,
-				IsDefault: plan.IsDefault,
+				ID:       id,
+				Name:     plan.Name,
+				Policies: policies,
 			}).
 			On("CONFLICT (id) DO UPDATE").
 			Set("name = EXCLUDED.name").
 			Set("policies = EXCLUDED.policies").
-			Set("is_default = EXCLUDED.is_default").
 			Set("updated_at = ?", time.Now()).
 			Exec(ctx)
 		if err != nil {
@@ -145,7 +127,6 @@ func GetAccountPlan(ctx context.Context, db *bun.DB, accountID string) (*Plan, e
 
 	return &Plan{
 		Name:      plan.Name,
-		IsDefault: plan.IsDefault,
 		Endpoints: endpoints,
 	}, nil
 }
@@ -170,7 +151,6 @@ func ListPlans(ctx context.Context, db *bun.DB) (Plans, error) {
 
 		plans[dbPlan.ID] = Plan{
 			Name:      dbPlan.Name,
-			IsDefault: dbPlan.IsDefault,
 			Endpoints: endpoints,
 		}
 	}
@@ -228,6 +208,7 @@ func SetDefaultPlan(ctx context.Context, db *bun.DB, planID string) error {
 	// Delete existing default plan (if any)
 	_, err = tx.NewDelete().
 		Model((*models.DefaultPlan)(nil)).
+		Where("created_at IS NOT NULL").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("clearing default plan: %w", err)

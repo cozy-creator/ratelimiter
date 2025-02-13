@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/uptrace/bun/driver/pgdriver"
 )
 
 func main() {
@@ -16,14 +18,11 @@ func main() {
 		dsn = "postgres://postgres:postgres@localhost:5432/ratelimiter?sslmode=disable"
 	}
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("connecting to database: %v", err)
-	}
+	db := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn)))
 	defer db.Close()
 
 	// Create migrations table if it doesn't exist
-	_, err = db.Exec(`
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
