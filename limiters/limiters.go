@@ -17,6 +17,10 @@ const (
 	FixedWindow  LimiterType = "fixed_window"
 	TokenBucket  LimiterType = "token_bucket"
 	Concurrency  LimiterType = "concurrency"
+
+	// Reserved unit types that cannot be used in policies
+	ReservedCreditUnit = "credit"
+	DefaultRequestUnit = "request" // Default unit type if none specified
 )
 
 // UnitKind represents what we're counting (requests or tokens)
@@ -27,11 +31,33 @@ const (
 	TokenUnit  UnitKind = "token"
 )
 
-// WindowLimit represents a time-based limit
+// WindowLimit represents a time-based limit for a specific unit type
 type WindowLimit struct {
-	Window   time.Duration `json:"window"`      // Time window
-	Limit    int64        `json:"limit"`       // Maximum requests/tokens in window
-	UnitKind UnitKind     `json:"unit_kind"`   // Whether to count requests or tokens
+	Window    time.Duration `json:"window"`     // Time window
+	Limit     int64        `json:"limit"`      // Maximum units in window
+	UnitType  string       `json:"unit_type"`  // Type of unit being limited (e.g., "request", "token", "image"). Defaults to "request" if empty
+}
+
+// Validate checks if the window limit configuration is valid
+func (w *WindowLimit) Validate() error {
+	if w.Window <= 0 {
+		return fmt.Errorf("window duration must be positive")
+	}
+	if w.Limit <= 0 {
+		return fmt.Errorf("limit must be positive")
+	}
+	if w.UnitType == ReservedCreditUnit {
+		return fmt.Errorf("'%s' is a reserved unit type that cannot be used in policies", ReservedCreditUnit)
+	}
+	return nil
+}
+
+// GetUnitType returns the unit type, defaulting to "request" if not specified
+func (w *WindowLimit) GetUnitType() string {
+	if w.UnitType == "" {
+		return DefaultRequestUnit
+	}
+	return w.UnitType
 }
 
 // TokenBucketLimit represents a token bucket configuration
@@ -43,10 +69,22 @@ type TokenBucketLimit struct {
 
 // Policy represents a rate limiting policy for an endpoint
 type Policy struct {
-	SlidingWindows []WindowLimit      `json:"sliding_windows,omitempty"`
-	FixedWindows   []WindowLimit      `json:"fixed_windows,omitempty"`
-	TokenBuckets   []TokenBucketLimit `json:"token_buckets,omitempty"`
-	MaxConcurrent  int64              `json:"max_concurrent,omitempty"`
+	Windows            []WindowLimit  `json:"windows,omitempty"`
+	MaxConcurrent      int64         `json:"max_concurrent,omitempty"`      // Maximum concurrent requests
+	ConcurrencyExpiry  time.Duration `json:"concurrency_expiry,omitempty"` // How long to track a request for concurrency
+}
+
+// Validate checks if the policy configuration is valid
+func (p *Policy) Validate() error {
+	for _, window := range p.Windows {
+		if err := window.Validate(); err != nil {
+			return fmt.Errorf("invalid window configuration: %w", err)
+		}
+	}
+	if p.MaxConcurrent < 0 {
+		return fmt.Errorf("max concurrent must be non-negative")
+	}
+	return nil
 }
 
 // RateLimiter handles rate limiting logic
@@ -89,201 +127,178 @@ func (r *RateLimiter) releaseLock(ctx context.Context, key string) error {
 	return r.rdb.Del(ctx, key+":lock").Err()
 }
 
-// CheckAndIncrement checks if a request can proceed and increments counters if allowed
-func (r *RateLimiter) CheckAndIncrement(ctx context.Context, key string, policy Policy, tokens int64) (bool, error) {
+// CheckAndIncrement checks if a request can proceed and increments counters if allowed.
+// Returns whether the request is allowed, rate limit info, and any error.
+func (r *RateLimiter) CheckAndIncrement(ctx context.Context, key string, policy Policy, unitAmounts map[string]int64, requestID string) (bool, map[string]*WindowInfo, error) {
+	// Validate policy first
+	if err := policy.Validate(); err != nil {
+		return false, nil, fmt.Errorf("invalid policy: %w", err)
+	}
+
 	// Try to acquire lock for the entire operation
 	locked, err := r.tryLock(ctx, key, 100*time.Millisecond)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if !locked {
-		return false, fmt.Errorf("could not acquire lock")
+		return false, nil, fmt.Errorf("could not acquire lock")
 	}
 	defer r.releaseLock(ctx, key)
 
 	now := time.Now()
-	nowNano := now.UnixNano()
+	info := make(map[string]*WindowInfo)
 
-	// First, check all limits without modifying anything
-	
-	// 1. Check concurrency
-	if policy.MaxConcurrent > 0 {
-		count, err := r.rdb.Get(ctx, key+":concurrent").Int64()
-		if err != nil {
-			if err == redis.Nil {
-				count = 0 				// Key doesn't exist, treat as 0 concurrent requests
-			} else {
-				return false, fmt.Errorf("getting concurrent count: %w", err)
-			}
-		}
-		if count >= policy.MaxConcurrent {
-			return false, nil
-		}
-	}
+	// Group windows by unit type to track most constraining for each
+	windowsByUnit := make(map[string]*WindowInfo)
 
-	// 2. Check sliding windows
-	for i, window := range policy.SlidingWindows {
-		windowKey := fmt.Sprintf("%s:sliding:%d", key, i)
-		windowStart := nowNano - window.Window.Nanoseconds()
-
-		var total int64
-		if window.UnitKind == TokenUnit {
-			// For token-based limits, sum the scores
-			scores, err := r.rdb.ZRangeByScoreWithScores(ctx, windowKey, &redis.ZRangeBy{
-				Min: fmt.Sprintf("%d", windowStart),
-				Max: fmt.Sprintf("%d", nowNano),
-			}).Result()
-			if err != nil && err != redis.Nil {
-				return false, fmt.Errorf("counting tokens: %w", err)
-			}
-			for _, z := range scores {
-				total += int64(z.Score)
-			}
-		} else {
-			// For request-based limits, count entries
-			count, err := r.rdb.ZCount(ctx, windowKey, 
-				fmt.Sprintf("%d", windowStart), 
-				fmt.Sprintf("%d", nowNano)).Result()
-			if err != nil && err != redis.Nil {
-				return false, fmt.Errorf("counting requests: %w", err)
-			}
-			total = count
-		}
-
-		increment := int64(1)
-		if window.UnitKind == TokenUnit {
-			increment = tokens
-		}
-		if total+increment > window.Limit {
-			return false, nil
-		}
-	}
-
-	// 3. Check fixed windows
-	for i, window := range policy.FixedWindows {
-		windowKey := fmt.Sprintf("%s:fixed:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
+	// Check all windows and gather rate limit info in one pass
+	for i, window := range policy.Windows {
+		windowKey := fmt.Sprintf("%s:window:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
+		
+		// Get current usage
 		count, err := r.rdb.Get(ctx, windowKey).Int64()
 		if err == redis.Nil {
 			count = 0
 		} else if err != nil {
-			return false, fmt.Errorf("getting fixed window count: %w", err)
+			return false, nil, fmt.Errorf("getting window count: %w", err)
 		}
 
-		increment := int64(1)
-		if window.UnitKind == TokenUnit {
-			increment = tokens
+		// Get TTL
+		ttl, err := r.rdb.TTL(ctx, windowKey).Result()
+		if err != nil && err != redis.Nil {
+			return false, nil, fmt.Errorf("getting ttl: %w", err)
 		}
-		if count+increment > window.Limit {
-			return false, nil
+		if ttl <= 0 {
+			// Calculate time until next window boundary
+			windowSeconds := int64(window.Window.Seconds())
+			currentWindowStart := (now.Unix() / windowSeconds) * windowSeconds
+			nextWindowStart := currentWindowStart + windowSeconds
+			ttl = time.Duration(nextWindowStart - now.Unix()) * time.Second
+		}
+
+		// Calculate remaining units
+		unitType := window.GetUnitType()
+		amount := unitAmounts[unitType]
+		if amount == 0 && unitType == DefaultRequestUnit {
+			amount = 1
+		}
+
+		// Check if this would exceed the limit
+		if count+amount > window.Limit {
+			// Create window info for the window that caused denial
+			windowInfo := &WindowInfo{
+				Limit:     window.Limit,
+				Remaining: max(0, window.Limit - count),
+				Reset:     ttl,
+			}
+			info[window.GetUnitType()] = windowInfo
+			return false, info, nil
+		}
+
+		// Update most constraining window info for this unit type
+		windowInfo := &WindowInfo{
+			Limit:     window.Limit,
+			Remaining: max(0, window.Limit - count),
+			Reset:     ttl,
+		}
+
+		existing, ok := windowsByUnit[unitType]
+		if !ok || (float64(windowInfo.Remaining)/float64(windowInfo.Limit)) < 
+			(float64(existing.Remaining)/float64(existing.Limit)) {
+			windowsByUnit[unitType] = windowInfo
 		}
 	}
 
-	// 4. Check token buckets
-	for i, bucket := range policy.TokenBuckets {
-		bucketKey := fmt.Sprintf("%s:bucket:%d", key, i)
-		lastUpdateKey := bucketKey + ":last_update"
-
-		// Get current tokens and last update time
-		currentTokens, err := r.rdb.Get(ctx, bucketKey).Int64()
-		if err == redis.Nil {
-			currentTokens = bucket.BucketSize
-		} else if err != nil {
-			return false, fmt.Errorf("getting tokens: %w", err)
+	// Check concurrency if enabled
+	if policy.MaxConcurrent > 0 {
+		expiry := policy.ConcurrencyExpiry
+		if expiry == 0 {
+			expiry = time.Minute // Default expiry
 		}
 
-		lastUpdate, err := r.rdb.Get(ctx, lastUpdateKey).Int64()
-		if err == redis.Nil {
-			lastUpdate = now.Unix()
-		} else if err != nil {
-			return false, fmt.Errorf("getting last update: %w", err)
+		count, err := r.rdb.ZCount(ctx,
+			key+":concurrent",
+			fmt.Sprintf("%d", now.Add(-expiry).Unix()),
+			fmt.Sprintf("%d", now.Unix()),
+		).Result()
+		if err != nil && err != redis.Nil {
+			return false, nil, fmt.Errorf("counting concurrent requests: %w", err)
 		}
 
-		// Calculate token refill
-		elapsed := now.Unix() - lastUpdate
-		currentTokens = min(bucket.BucketSize, currentTokens+int64(float64(elapsed)*bucket.RefillRate))
-
-		increment := int64(1)
-		if bucket.UnitKind == TokenUnit {
-			increment = tokens
+		info["concurrent"] = &WindowInfo{
+			Limit:     policy.MaxConcurrent,
+			Remaining: max(0, policy.MaxConcurrent - count),
+			Reset:     expiry,
 		}
-		if currentTokens < increment {
-			return false, nil
+
+		if count >= policy.MaxConcurrent {
+			return false, info, nil
 		}
 	}
 
-	// If all checks passed, now perform all increments atomically using a pipeline
+	// If we got here, all checks passed. Perform all increments atomically
 	pipe := r.rdb.Pipeline()
 
-	// 1. Increment concurrency
+	// Record concurrent request if enabled
 	if policy.MaxConcurrent > 0 {
-		pipe.Incr(ctx, key+":concurrent")
-		pipe.Expire(ctx, key+":concurrent", 10*time.Minute)
+		expiry := policy.ConcurrencyExpiry
+		if expiry == 0 {
+			expiry = time.Minute
+		}
+		pipe.ZAdd(ctx, key+":concurrent", redis.Z{
+			Score:  float64(now.Unix()),
+			Member: requestID,
+		})
+		pipe.Expire(ctx, key+":concurrent", expiry)
 	}
 
-	// 2. Update sliding windows
-	for i, window := range policy.SlidingWindows {
-		windowKey := fmt.Sprintf("%s:sliding:%d", key, i)
-		increment := int64(1)
-		if window.UnitKind == TokenUnit {
-			increment = tokens
+	// Update fixed windows
+	for i, window := range policy.Windows {
+		windowKey := fmt.Sprintf("%s:window:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
+		amount := unitAmounts[window.GetUnitType()]
+		if amount == 0 && window.GetUnitType() == DefaultRequestUnit {
+			amount = 1
 		}
-		// Remove old entries and add new one
-		pipe.ZRemRangeByScore(ctx, windowKey, "0", fmt.Sprintf("%d", nowNano-window.Window.Nanoseconds()))
-		pipe.ZAdd(ctx, windowKey, redis.Z{Score: float64(increment), Member: nowNano})
-		pipe.Expire(ctx, windowKey, calculateExpiration(window.Window))
-	}
-
-	// 3. Update fixed windows
-	for i, window := range policy.FixedWindows {
-		windowKey := fmt.Sprintf("%s:fixed:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
-		increment := int64(1)
-		if window.UnitKind == TokenUnit {
-			increment = tokens
+		if amount > 0 {
+			pipe.IncrBy(ctx, windowKey, amount)
+			pipe.Expire(ctx, windowKey, calculateExpiration(window.Window))
 		}
-		pipe.IncrBy(ctx, windowKey, increment)
-		pipe.Expire(ctx, windowKey, calculateExpiration(window.Window))
-	}
-
-	// 4. Update token buckets
-	for i, bucket := range policy.TokenBuckets {
-		bucketKey := fmt.Sprintf("%s:bucket:%d", key, i)
-		lastUpdateKey := bucketKey + ":last_update"
-		increment := int64(1)
-		if bucket.UnitKind == TokenUnit {
-			increment = tokens
-		}
-
-		currentTokens, _ := r.rdb.Get(ctx, bucketKey).Int64() // We already checked this exists
-		lastUpdate, _ := r.rdb.Get(ctx, lastUpdateKey).Int64()
-		elapsed := now.Unix() - lastUpdate
-		newTokens := min(bucket.BucketSize, currentTokens+int64(float64(elapsed)*bucket.RefillRate)) - increment
-
-		pipe.Set(ctx, bucketKey, newTokens, 24*time.Hour)
-		pipe.Set(ctx, lastUpdateKey, now.Unix(), 24*time.Hour)
 	}
 
 	// Execute all updates atomically
 	_, err = pipe.Exec(ctx)
 	if err != nil {
-		return false, fmt.Errorf("executing updates: %w", err)
+		return false, nil, fmt.Errorf("executing updates: %w", err)
 	}
 
-	return true, nil
+	// Return the most constraining window info for each unit type
+	for unitType, windowInfo := range windowsByUnit {
+		info[unitType] = windowInfo
+	}
+
+	// Update concurrency info if enabled
+	if policy.MaxConcurrent > 0 {
+		info["concurrent"].Remaining = max(0, info["concurrent"].Remaining - 1) // Subtract 1 for the request we just added
+	}
+
+	return true, info, nil
 }
 
-// DecrementConcurrency decrements the concurrent requests counter
-func (r *RateLimiter) DecrementConcurrency(ctx context.Context, key string) error {
-	key = key + ":concurrent"
-	pipe := r.rdb.Pipeline()
-	pipe.Decr(ctx, key)
-	pipe.Expire(ctx, key, 10*time.Minute)
-	_, err := pipe.Exec(ctx)
-	return err
+// gatherRemainingWindowInfo ensures we have window info for all unit types
+// even if we're returning early due to a limit being exceeded
+func (r *RateLimiter) gatherRemainingWindowInfo(existingInfo map[string]*WindowInfo) map[string]*WindowInfo {
+	info := make(map[string]*WindowInfo)
+	for unitType, windowInfo := range existingInfo {
+		info[unitType] = windowInfo
+	}
+	return info
 }
 
-// ForceConsumeTokens consumes tokens from token-based limiters, allowing them to go negative
-func (r *RateLimiter) ForceConsumeTokens(ctx context.Context, key string, policy Policy, tokens int64) error {
-	// Try to acquire lock
+// ForceDeductUnits forcefully deducts units from the rate limiter,
+// even if it would exceed limits. This is used for post-request accounting
+// when resources have already been consumed.
+func (r *RateLimiter) ForceDeductUnits(ctx context.Context, key string, policy Policy, unitAmounts map[string]int64) error {
+	// Try to acquire lock for the operation
 	locked, err := r.tryLock(ctx, key, 100*time.Millisecond)
 	if err != nil {
 		return err
@@ -293,166 +308,114 @@ func (r *RateLimiter) ForceConsumeTokens(ctx context.Context, key string, policy
 	}
 	defer r.releaseLock(ctx, key)
 
-	// Update sliding windows
-	for i, window := range policy.SlidingWindows {
-		if window.UnitKind == TokenUnit {
-			windowKey := fmt.Sprintf("%s:sliding:%d", key, i)
-			now := time.Now().UnixNano()
-			// Add tokens without checking limits
-			err = r.rdb.ZAdd(ctx, windowKey, redis.Z{Score: float64(tokens), Member: now}).Err()
-			if err != nil {
-				return fmt.Errorf("updating sliding window: %w", err)
-			}
-		}
-	}
+	now := time.Now()
+	pipe := r.rdb.Pipeline()
 
 	// Update fixed windows
-	for i, window := range policy.FixedWindows {
-		if window.UnitKind == TokenUnit {
-			windowKey := fmt.Sprintf("%s:fixed:%d:%d", key, i, time.Now().Unix()/int64(window.Window.Seconds()))
-			// Add tokens without checking limits
-			err = r.rdb.IncrBy(ctx, windowKey, tokens).Err()
-			if err != nil {
-				return fmt.Errorf("updating fixed window: %w", err)
-			}
+	for i, window := range policy.Windows {
+		windowKey := fmt.Sprintf("%s:window:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
+		amount := unitAmounts[window.GetUnitType()]
+		if amount > 0 {
+			pipe.IncrBy(ctx, windowKey, amount)
+			pipe.Expire(ctx, windowKey, calculateExpiration(window.Window))
 		}
 	}
 
-	// Update token buckets
-	for i, bucket := range policy.TokenBuckets {
-		if bucket.UnitKind == TokenUnit {
-			bucketKey := fmt.Sprintf("%s:bucket:%d", key, i)
-			// Subtract tokens without checking limits
-			err = r.rdb.DecrBy(ctx, bucketKey, tokens).Err()
-			if err != nil {
-				return fmt.Errorf("updating token bucket: %w", err)
-			}
+	// Execute all updates atomically
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("executing updates: %w", err)
+	}
+
+	return nil
+}
+
+// EndRequest handles cleanup after a request ends
+func (r *RateLimiter) EndRequest(ctx context.Context, key string, policy Policy, requestID string, finalUnits map[string]int64) error {
+	// First, try to deduct any final units
+	if len(finalUnits) > 0 {
+		if err := r.ForceDeductUnits(ctx, key, policy, finalUnits); err != nil {
+			return fmt.Errorf("deducting final units: %w", err)
+		}
+	}
+
+	// Then clean up the concurrent request tracking
+	if policy.MaxConcurrent > 0 {
+		err := r.rdb.ZRem(ctx, key+":concurrent", requestID).Err()
+		if err != nil {
+			return fmt.Errorf("removing concurrent request: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func min(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // GetRateLimitInfo returns the current rate limit information for a key and policy
-func (r *RateLimiter) GetRateLimitInfo(ctx context.Context, key string, policy Policy) (*RateLimitInfo, error) {
-	info := &RateLimitInfo{}
+func (r *RateLimiter) GetRateLimitInfo(ctx context.Context, key string, policy Policy) (map[string]*WindowInfo, error) {
+	info := make(map[string]*WindowInfo)
+	now := time.Now()
 
-	// Get request-based limits
-	for i, window := range policy.SlidingWindows {
-		if window.UnitKind == RequestUnit {
-			windowKey := fmt.Sprintf("%s:sliding:%d", key, i)
-			now := time.Now().UnixNano()
-			windowStart := now - window.Window.Nanoseconds()
-
-			// Get current count
-			count, err := r.rdb.ZCount(ctx, windowKey, 
-				fmt.Sprintf("%d", windowStart), 
-				fmt.Sprintf("%d", now)).Result()
-			if err != nil && err != redis.Nil {
-				return nil, fmt.Errorf("counting requests: %w", err)
-			}
-
-			// Update request info
-			info.RequestLimit = window.Limit
-			info.RequestRemaining = max(0, window.Limit - count)
-
-			// Calculate reset time
-			ttl, err := r.rdb.TTL(ctx, windowKey).Result()
-			if err != nil && err != redis.Nil {
-				return nil, fmt.Errorf("getting ttl: %w", err)
-			}
-			if ttl > 0 {
-				info.RequestReset = ttl
-			} else {
-				info.RequestReset = window.Window
-			}
-			break // Use the first request window found
-		}
-	}
-
-	// Get token-based limits
-	for i, window := range policy.SlidingWindows {
-		if window.UnitKind == TokenUnit {
-			windowKey := fmt.Sprintf("%s:sliding:%d", key, i)
-			now := time.Now().UnixNano()
-			windowStart := now - window.Window.Nanoseconds()
-
-			// Get current token count
-			scores, err := r.rdb.ZRangeByScoreWithScores(ctx, windowKey, &redis.ZRangeBy{
-				Min: fmt.Sprintf("%d", windowStart),
-				Max: fmt.Sprintf("%d", now),
-			}).Result()
-			if err != nil && err != redis.Nil {
-				return nil, fmt.Errorf("counting tokens: %w", err)
-			}
-
-			var total int64
-			for _, z := range scores {
-				total += int64(z.Score)
-			}
-
-			// Update token info
-			info.TokenLimit = window.Limit
-			info.TokenRemaining = max(0, window.Limit - total)
-
-			// Calculate reset time
-			ttl, err := r.rdb.TTL(ctx, windowKey).Result()
-			if err != nil && err != redis.Nil {
-				return nil, fmt.Errorf("getting ttl: %w", err)
-			}
-			if ttl > 0 {
-				info.TokenReset = ttl
-			} else {
-				info.TokenReset = window.Window
-			}
-			break // Use the first token window found
-		}
-	}
-
-	// If no sliding windows, check token buckets
-	if info.TokenLimit == 0 && len(policy.TokenBuckets) > 0 {
-		bucket := policy.TokenBuckets[0] // Use the first bucket
-		bucketKey := fmt.Sprintf("%s:bucket:0", key)
-
-		// Get current tokens
-		tokens, err := r.rdb.Get(ctx, bucketKey).Int64()
+	// Get window limits
+	for i, window := range policy.Windows {
+		windowKey := fmt.Sprintf("%s:window:%d:%d", key, i, now.Unix()/int64(window.Window.Seconds()))
+		
+		count, err := r.rdb.Get(ctx, windowKey).Int64()
 		if err == redis.Nil {
-			tokens = bucket.BucketSize
+			count = 0
 		} else if err != nil {
-			return nil, fmt.Errorf("getting tokens: %w", err)
+			return nil, fmt.Errorf("getting window count: %w", err)
 		}
 
-		info.TokenLimit = bucket.BucketSize
-		info.TokenRemaining = max(0, tokens)
+		ttl, err := r.rdb.TTL(ctx, windowKey).Result()
+		if err != nil && err != redis.Nil {
+			return nil, fmt.Errorf("getting ttl: %w", err)
+		}
+		if ttl <= 0 {
+			// Calculate time until next window boundary
+			windowSeconds := int64(window.Window.Seconds())
+			currentWindowStart := (now.Unix() / windowSeconds) * windowSeconds
+			nextWindowStart := currentWindowStart + windowSeconds
+			ttl = time.Duration(nextWindowStart - now.Unix()) * time.Second
+		}
 
-		// For token buckets, reset time is based on refill rate
-		if tokens < bucket.BucketSize && bucket.RefillRate > 0 {
-			tokensNeeded := bucket.BucketSize - tokens
-			info.TokenReset = time.Duration(float64(tokensNeeded) / bucket.RefillRate * float64(time.Second))
+		info[window.GetUnitType()] = &WindowInfo{
+			Limit:     window.Limit,
+			Remaining: max(0, window.Limit - count),
+			Reset:     ttl,
+		}
+	}
+
+	// Get concurrency info if enabled
+	if policy.MaxConcurrent > 0 {
+		expiry := policy.ConcurrencyExpiry
+		if expiry == 0 {
+			expiry = time.Minute
+		}
+
+		count, err := r.rdb.ZCount(ctx,
+			key+":concurrent",
+			fmt.Sprintf("%d", now.Add(-expiry).Unix()),
+			fmt.Sprintf("%d", now.Unix()),
+		).Result()
+		if err != nil && err != redis.Nil {
+			return nil, fmt.Errorf("counting concurrent requests: %w", err)
+		}
+
+		info["concurrent"] = &WindowInfo{
+			Limit:     policy.MaxConcurrent,
+			Remaining: max(0, policy.MaxConcurrent - count),
+			Reset:     expiry,
 		}
 	}
 
 	return info, nil
 }
 
-// RateLimitInfo represents the current state of rate limits
-type RateLimitInfo struct {
-	// Request-based limits
-	RequestLimit     int64         `json:"request_limit"`      // Maximum requests allowed
-	RequestRemaining int64         `json:"request_remaining"`  // Remaining requests
-	RequestReset     time.Duration `json:"request_reset"`      // Time until request limit resets
-
-	// Token-based limits
-	TokenLimit     int64         `json:"token_limit"`      // Maximum tokens allowed
-	TokenRemaining int64         `json:"token_remaining"`  // Remaining tokens
-	TokenReset     time.Duration `json:"token_reset"`      // Time until token limit resets
+// WindowInfo represents the current state of a rate limit window
+type WindowInfo struct {
+	Limit     int64         `json:"limit"`      // Maximum units allowed
+	Remaining int64         `json:"remaining"`   // Remaining units
+	Reset     time.Duration `json:"reset"`      // Time until limit resets
 }
 
 func max(a, b int64) int64 {

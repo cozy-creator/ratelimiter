@@ -11,7 +11,8 @@ import (
 	"github.com/cozy-creator/ratelimiter"
 	"github.com/cozy-creator/ratelimiter/admin"
 	"github.com/cozy-creator/ratelimiter/limiters"
-	"github.com/cozy-creator/ratelimiter/models"
+	"github.com/google/uuid"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func RunStressTest() {
@@ -33,26 +34,25 @@ func RunStressTest() {
 			Name: "Free Tier",
 			Endpoints: map[string]limiters.Policy{
 				"text2Media": {
-					FixedWindows: []limiters.WindowLimit{
+					Windows: []limiters.WindowLimit{
 						{
 							Window:   time.Minute,
 							Limit:    10,
-							UnitKind: limiters.RequestUnit,
+							UnitType: "request",
 						},
 						{
-							Window:   3 * time.Hour,
-							Limit:    200,
-							UnitKind: limiters.RequestUnit,
+							Window:   time.Hour,
+							Limit:    1000,
+							UnitType: "token",
 						},
-					},
-					TokenBuckets: []limiters.TokenBucketLimit{
 						{
-							BucketSize: 100,
-							RefillRate: 1.0, // 1 token per second
-							UnitKind:   limiters.TokenUnit,
+							Window:   time.Hour,
+							Limit:    100,
+							UnitType: "gpu-second",
 						},
 					},
-					MaxConcurrent: 4,
+					MaxConcurrent:     4,
+					ConcurrencyExpiry: time.Minute,
 				},
 			},
 		},
@@ -60,26 +60,35 @@ func RunStressTest() {
 			Name: "Premium Tier",
 			Endpoints: map[string]limiters.Policy{
 				"text2Media": {
-					TokenBuckets: []limiters.TokenBucketLimit{
+					Windows: []limiters.WindowLimit{
 						{
-							BucketSize: 1000,
-							RefillRate: 10.0, // 10 tokens per second
-							UnitKind:   limiters.TokenUnit,
+							Window:   time.Hour,
+							Limit:    5000,
+							UnitType: "token",
+						},
+						{
+							Window:   time.Hour,
+							Limit:    500,
+							UnitType: "gpu-second",
 						},
 					},
-					MaxConcurrent: 8,
+					MaxConcurrent:     8,
+					ConcurrencyExpiry: time.Minute,
 				},
 			},
 		},
 	}
 
 	// Apply plans
-	if err := admin.ApplyPlans(ctx, client.DB(), plans); err != nil {
-		log.Fatalf("applying plans: %v", err)
+	if err := client.SetPlan(ctx, "free_tier", "Free Tier", plans["free_tier"].Endpoints); err != nil {
+		log.Fatalf("setting free tier plan: %v", err)
+	}
+	if err := client.SetPlan(ctx, "premium_tier", "Premium Tier", plans["premium_tier"].Endpoints); err != nil {
+		log.Fatalf("setting premium tier plan: %v", err)
 	}
 
 	// Set free tier as default plan
-	if err := admin.SetDefaultPlan(ctx, client.DB(), "free_tier"); err != nil {
+	if err := client.SetDefaultPlan(ctx, "free_tier"); err != nil {
 		log.Fatalf("unable to set default plan: %v", err)
 	}
 
@@ -89,50 +98,66 @@ func RunStressTest() {
 		planID   string
 		credits  int64
 	}{
-		{"user1", "free_tier", 1000},
-		{"user2", "free_tier", 1000},
-		{"user3", "premium_tier", 5000},
-		{"user4", "premium_tier", 5000},
+		{uuid.New().String(), "free_tier", 1000},
+		{uuid.New().String(), "free_tier", 1000},
+		{uuid.New().String(), "premium_tier", 5000},
+		{uuid.New().String(), "premium_tier", 5000},
+	}
+
+	// Print user IDs for reference
+	for _, user := range users {
+		log.Printf("User %s: %s plan", user.id, user.planID)
 	}
 
 	// Create accounts and assign plans
 	for _, user := range users {
-		// Create/update account with upsert
-		account := &models.Account{
-			ID:     user.id,
-			PlanID: user.planID,
-		}
-		_, err := client.DB().NewInsert().
-			Model(account).
-			On("CONFLICT (id) DO UPDATE").
-			Set("plan_id = EXCLUDED.plan_id").
-			Set("updated_at = ?", time.Now()).
-			Exec(ctx)
-		if err != nil {
-			log.Fatalf("upserting account for %s: %v", user.id, err)
+		// Create account with plan
+		if err := client.CreateAccount(ctx, user.id, user.planID); err != nil {
+			log.Fatalf("creating account for %s: %v", user.id, err)
 		}
 
-		// First, expire any existing quota blocks for this account
-		_, err = client.DB().NewUpdate().
-			Model((*models.QuotaBlock)(nil)).
-			Set("expires_at = ?", time.Now()).
-			Where("account_id = ? AND (expires_at IS NULL OR expires_at > ?)", user.id, time.Now()).
-			Exec(ctx)
-		if err != nil {
+		// Expire any existing quota blocks
+		if err := client.ExpireQuotaBlocks(ctx, user.id); err != nil {
 			log.Fatalf("expiring old quota blocks for %s: %v", user.id, err)
 		}
 
-		// Create new quota block
-		quotaBlock := &models.QuotaBlock{
-			AccountID: user.id,
-			Credits:   user.credits,
-			ExpiresAt: time.Now().Add(30 * 24 * time.Hour), // Expires in 30 days
-		}
-		_, err = client.DB().NewInsert().
-			Model(quotaBlock).
-			Exec(ctx)
-		if err != nil {
-			log.Fatalf("creating quota block for %s: %v", user.id, err)
+		// Create multiple random quota blocks
+		totalCredits := user.credits
+		numBlocks := rand.Intn(3) + 2 // 2-4 blocks
+		for i := 0; i < numBlocks; i++ {
+			var credits int64
+			if i == numBlocks-1 {
+				// Last block gets remaining credits
+				credits = totalCredits
+			} else {
+				// Random portion of remaining credits
+				maxCredits := totalCredits * 2 / 3 // At most 2/3 of remaining
+				if maxCredits == 0 {
+					continue
+				}
+				credits = rand.Int63n(maxCredits) + 1
+				totalCredits -= credits
+			}
+
+			// Random expiration between 1 day and 60 days
+			expiresAt := time.Now().Add(time.Duration(rand.Intn(59)+1) * 24 * time.Hour)
+			
+			// 20% chance of no expiration
+			if rand.Float32() < 0.2 {
+				expiresAt = time.Time{} // Zero time means no expiration
+			}
+
+			metadata, err := msgpack.Marshal(map[string]interface{}{
+				"block_number": i + 1,
+				"total_blocks": numBlocks,
+			})
+			if err != nil {
+				log.Fatalf("marshaling metadata for %s: %v", user.id, err)
+			}
+
+			if err := client.CreateQuotaBlock(ctx, user.id, credits, expiresAt, metadata); err != nil {
+				log.Fatalf("creating quota block for %s: %v", user.id, err)
+			}
 		}
 	}
 
@@ -140,9 +165,9 @@ func RunStressTest() {
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	// Launch 10 goroutines per user
+	// Launch 3 goroutines per user (reduced from 10)
 	for _, user := range users {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 3; i++ {
 			wg.Add(1)
 			go func(userID string, routineID int) {
 				defer wg.Done()
@@ -157,44 +182,68 @@ func RunStressTest() {
 						// Generate unique request ID
 						requestID := fmt.Sprintf("%s-%d-%d", userID, routineID, time.Now().UnixNano())
 
-						// Attempt request with both token and credit consumption
-						allowed, err := client.AttemptRequest(ctx, requestID, userID, "text2Media",
-							ratelimiter.DeductTokens(5),
-							ratelimiter.DeductCredits(2), // Consume 2 credits per request
+						// Simulate different request sizes
+						tokens := int64(rand.Intn(100) + 1)     // 1-100 tokens
+						gpuSeconds := int64(rand.Intn(10) + 1)  // 1-10 GPU seconds
+						credits := int64(rand.Intn(5) + 1)      // 1-5 credits
+
+						// Check if user has enough credits before attempting request
+						hasBalance, err := client.HasMinBalance(ctx, userID, credits)
+						if err != nil {
+							log.Printf("User %s: error checking balance - %v", userID, err)
+							continue
+						}
+						if !hasBalance {
+							log.Printf("User %s: insufficient balance (need %d)", userID, credits)
+							time.Sleep(time.Second) // Back off before retrying
+							continue
+						}
+
+						// Attempt request with token consumption
+						allowed, info, err := client.AttemptRequest(ctx, requestID, userID, "text2Media",
+							ratelimiter.DeductUnits("token", tokens),
+							ratelimiter.DeductUnits("gpu-second", gpuSeconds),
 						)
 						if err != nil {
-							log.Printf("Error attempting request for %s: %v", userID, err)
+							log.Printf("User %s: error - %v", userID, err)
 							continue
 						}
 
 						if allowed {
-							log.Printf("Request allowed for %s (routine %d)", userID, routineID)
-							// Simulate some work
-							time.Sleep(time.Duration(rand.Int63n(30_000)) * time.Millisecond)
-
-							// End request with additional consumption
-							result, err := client.EndRequest(ctx, requestID,
-								ratelimiter.DeductTokens(3),  // Additional tokens based on response size
-								ratelimiter.DeductCredits(1), // Additional credit for processing
-							)
-							if err != nil {
-								log.Printf("Error ending request for %s: %v", userID, err)
+							log.Printf("User %s: request allowed", userID)
+							for unitType, window := range info {
+								log.Printf("  %s: %d/%d (reset in %v)", 
+									unitType, window.Remaining, window.Limit, window.Reset)
 							}
-							if result != nil && result.RemainingDue > 0 {
-								log.Printf("Warning: Could only consume %d of %d requested credits for %s",
-									result.Consumed, result.Requested, userID)
+
+							// Simulate some work
+							time.Sleep(time.Duration(rand.Int63n(100)) * time.Millisecond)
+
+							// End request with final consumption
+							finalTokens := int64(rand.Intn(100) + 1)  // 1-100 additional tokens
+							finalGPU := int64(rand.Intn(5) + 1)       // 1-5 additional GPU seconds
+							
+							if err := client.EndRequest(ctx, requestID,
+								ratelimiter.DeductUnits("token", finalTokens),
+								ratelimiter.DeductUnits("gpu-second", finalGPU),
+							); err != nil {
+								log.Printf("User %s: error ending request - %v", userID, err)
+							}
+
+							// Deduct final credits
+							finalCredits := int64(rand.Intn(3) + 1)   // 1-3 additional credits
+							result, err := client.DeductCredits(ctx, userID, finalCredits, ratelimiter.WithRequireFullAmount(true))
+							if err != nil {
+								log.Printf("User %s: error deducting credits - %v", userID, err)
+							} else if result.Remaining > 0 {
+								log.Printf("User %s: partial credit deduction %d/%d", 
+									userID, result.Deducted, result.Requested)
 							}
 						} else {
-							// Get rate limit info to understand why the request was denied
-							info, err := client.GetRateLimitInfo(ctx, userID, "text2Media")
-							if err != nil {
-								log.Printf("Request denied for %s (routine %d) - Error getting rate limit info: %v", 
-									userID, routineID, err)
-							} else {
-								log.Printf("Request denied for %s (routine %d) - Limits: [Requests: %d/%d (resets in %v)] [Tokens: %d/%d (resets in %v)]",
-									userID, routineID,
-									info.RequestRemaining, info.RequestLimit, info.RequestReset,
-									info.TokenRemaining, info.TokenLimit, info.TokenReset)
+							log.Printf("User %s: request denied", userID)
+							for unitType, window := range info {
+								log.Printf("  %s: %d/%d (reset in %v)",
+									unitType, window.Remaining, window.Limit, window.Reset)
 							}
 							// Back off a bit before retrying
 							time.Sleep(time.Second)
@@ -209,11 +258,13 @@ func RunStressTest() {
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	log.Printf("Stress test completed in %v", elapsed)
+	log.Printf("Test completed in %v", elapsed)
 }
 
 func main() {
 	log.Println("Starting rate limiter stress test...")
+
 	RunStressTest()
+
 	log.Println("Stress test complete!")
 }

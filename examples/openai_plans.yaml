@@ -17,12 +17,12 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 5
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 1
-            unit_kind: token
+            unit_kind: image
 
   tier_1:
     name: Tier 1
@@ -58,12 +58,12 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: token
+            unit_kind: image
 
   tier_2:
     name: Tier 2
@@ -96,12 +96,12 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 2_500
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 2_500
-            unit_kind: token
+            unit_kind: image
 
   tier_3:
     name: Tier 3
@@ -134,12 +134,12 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: token
+            unit_kind: image
 
   tier_4:
     name: Tier 4
@@ -164,12 +164,12 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 7_500
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 7_500
-            unit_kind: token
+            unit_kind: image
 
   tier_5:
     name: Tier 5
@@ -194,9 +194,9 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: token
+            unit_kind: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: token
+            unit_kind: image

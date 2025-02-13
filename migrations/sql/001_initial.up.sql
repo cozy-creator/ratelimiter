@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS ratelimit.quota_block (
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_quota_block_account FOREIGN KEY (account_id) REFERENCES ratelimit.account(id)
+    CONSTRAINT fk_quota_block_account FOREIGN KEY (account_id) REFERENCES ratelimit.account(id),
+    CONSTRAINT credits_non_negative CHECK (credits >= 0)
 );
 
 -- Create account_policies as a materialized view
@@ -70,6 +71,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_account_policies_account_id
     ON ratelimit.account_policies(account_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_account_credit_balance_account_id 
     ON ratelimit.account_credit_balance(account_id);
+
+-- Add additional indexes for performance
+CREATE INDEX IF NOT EXISTS idx_quota_block_expires_at 
+    ON ratelimit.quota_block(expires_at) 
+    WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_quota_block_updated_at 
+    ON ratelimit.quota_block(updated_at);
 
 -- Create trigger to update updated_at
 CREATE OR REPLACE FUNCTION ratelimit.update_updated_at_column()
@@ -130,4 +138,4 @@ CREATE TRIGGER refresh_account_policies_on_plan_change
     AFTER INSERT OR UPDATE OR DELETE ON ratelimit.plan
     FOR EACH STATEMENT
     EXECUTE FUNCTION ratelimit.refresh_account_policies();
-    
+
