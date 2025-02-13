@@ -4,11 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
 
-	"github.com/cozy-creator/ratelimiter/admin"
 	"github.com/cozy-creator/ratelimiter/limiters"
-	"github.com/cozy-creator/ratelimiter/models"
 	"github.com/cozy-creator/ratelimiter/service"
 	"github.com/redis/go-redis/v9"
 	"github.com/uptrace/bun"
@@ -237,89 +234,5 @@ func WithRequireFullAmount(require bool) service.DeductCreditsOption {
 // Use WithRequireFullAmount(true) to require the full amount to be available.
 func (c *Client) DeductCredits(ctx context.Context, accountID string, credits int64, opts ...service.DeductCreditsOption) (*service.DeductCreditsResult, error) {
 	return c.svc.DeductCredits(ctx, accountID, credits, opts...)
-}
-
-// CreateAccount creates a new account with the given plan
-func (c *Client) CreateAccount(ctx context.Context, accountID string, planID string) error {
-	account := &models.Account{
-		ID:     accountID,
-		PlanID: planID,
-	}
-	_, err := c.DB().NewInsert().
-		Model(account).
-		On("CONFLICT (id) DO UPDATE").
-		Set("plan_id = EXCLUDED.plan_id").
-		Set("updated_at = ?", time.Now()).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("creating account: %w", err)
-	}
-	return nil
-}
-
-// AssignPlan assigns a plan to an account
-func (c *Client) AssignPlan(ctx context.Context, accountID string, planID string) error {
-	return admin.AssignPlan(ctx, c.DB(), accountID, planID)
-}
-
-// SetPlan creates or updates a rate limiting plan
-func (c *Client) SetPlan(ctx context.Context, planID string, name string, policy map[string]limiters.Policy) error {
-	plan := admin.Plan{
-		Name:      name,
-		Endpoints: policy,
-	}
-	return admin.ApplyPlans(ctx, c.DB(), admin.Plans{planID: plan})
-}
-
-// AddPlan is deprecated, use SetPlan instead
-func (c *Client) AddPlan(ctx context.Context, planID string, name string, endpoints map[string]limiters.Policy) error {
-	return c.SetPlan(ctx, planID, name, endpoints)
-}
-
-// CreateQuotaBlock creates a new quota block for an account
-func (c *Client) CreateQuotaBlock(ctx context.Context, accountID string, credits int64, expiresAt time.Time, metadata []byte) error {
-	quotaBlock := &models.QuotaBlock{
-		AccountID: accountID,
-		Credits:   credits,
-		ExpiresAt: expiresAt,
-		Metadata:  metadata,
-	}
-	_, err := c.DB().NewInsert().
-		Model(quotaBlock).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("creating quota block: %w", err)
-	}
-	return nil
-}
-
-// DeleteQuotaBlock deletes a quota block by ID
-func (c *Client) DeleteQuotaBlock(ctx context.Context, blockID string) error {
-	_, err := c.DB().NewDelete().
-		Model((*models.QuotaBlock)(nil)).
-		Where("id = ?", blockID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("deleting quota block: %w", err)
-	}
-	return nil
-}
-
-// ExpireQuotaBlocks expires all active quota blocks for an account
-func (c *Client) ExpireQuotaBlocks(ctx context.Context, accountID string) error {
-	_, err := c.DB().NewUpdate().
-		Model((*models.QuotaBlock)(nil)).
-		Set("expires_at = ?", time.Now()).
-		Where("account_id = ? AND (expires_at IS NULL OR expires_at > ?)", accountID, time.Now()).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("expiring quota blocks: %w", err)
-	}
-	return nil
-}
-
-// SetDefaultPlan sets a plan as the default
-func (c *Client) SetDefaultPlan(ctx context.Context, planID string) error {
-	return admin.SetDefaultPlan(ctx, c.DB(), planID)
 }
 

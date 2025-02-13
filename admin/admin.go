@@ -266,4 +266,46 @@ func GetPlan(ctx context.Context, db *bun.DB, planID string) (*Plan, error) {
 		Name:      dbPlan.Name,
 		Endpoints: endpoints,
 	}, nil
-} 
+}
+
+// CreateQuotaBlock creates a new quota block for an account
+func CreateQuotaBlock(ctx context.Context, db *bun.DB, accountID string, credits int64, expiresAt time.Time, metadata []byte) error {
+	quotaBlock := &models.QuotaBlock{
+		AccountID: accountID,
+		Credits:   credits,
+		ExpiresAt: expiresAt,
+		Metadata:  metadata,
+	}
+	_, err := db.NewInsert().
+		Model(quotaBlock).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("creating quota block: %w", err)
+	}
+	return nil
+}
+
+// DeleteQuotaBlock deletes a quota block by ID
+func DeleteQuotaBlock(ctx context.Context, db *bun.DB, blockID string) error {
+	_, err := db.NewDelete().
+		Model((*models.QuotaBlock)(nil)).
+		Where("id = ?", blockID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("deleting quota block: %w", err)
+	}
+	return nil
+}
+
+// ExpireQuotaBlocks expires all active quota blocks for an account
+func ExpireQuotaBlocks(ctx context.Context, db *bun.DB, accountID string) error {
+	_, err := db.NewUpdate().
+		Model((*models.QuotaBlock)(nil)).
+		Set("expires_at = ?", time.Now()).
+		Where("account_id = ? AND (expires_at IS NULL OR expires_at > ?)", accountID, time.Now()).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("expiring quota blocks: %w", err)
+	}
+	return nil
+}

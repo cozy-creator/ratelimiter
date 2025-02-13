@@ -6,23 +6,23 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 3
-            unit_kind: request
+            unit_type: request
           - window: 86_400s
             limit: 200
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 40_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 5
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 1
-            unit_kind: image
+            unit_type: image
 
   tier_1:
     name: Tier 1
@@ -31,39 +31,39 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 30_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-mini:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: request
+            unit_type: request
           - window: 86_400s
             limit: 10_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 200_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-realtime-preview:
         fixed_windows:
           - window: 60s
             limit: 200
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 40_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 500
-            unit_kind: image
+            unit_type: image
 
   tier_2:
     name: Tier 2
@@ -72,36 +72,36 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 450_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-mini:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 2_000_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-realtime-preview:
         fixed_windows:
           - window: 60s
             limit: 400
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 200_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 2_500
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 2_500
-            unit_kind: image
+            unit_type: image
 
   tier_3:
     name: Tier 3
@@ -110,36 +110,36 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 800_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-mini:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 4_000_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-realtime-preview:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 800_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 5_000
-            unit_kind: image
+            unit_type: image
 
   tier_4:
     name: Tier 4
@@ -148,28 +148,28 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 2_000_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-mini:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 10_000_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 7_500
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 7_500
-            unit_kind: image
+            unit_type: image
 
   tier_5:
     name: Tier 5
@@ -178,25 +178,25 @@ plans:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 30_000_000
-            unit_kind: token
+            unit_type: token
       gpt-4o-mini:
         fixed_windows:
           - window: 60s
             limit: 30_000
-            unit_kind: request
+            unit_type: request
           - window: 60s
             limit: 150_000_000
-            unit_kind: token
+            unit_type: token
       dall-e-2:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: image
+            unit_type: image
       dall-e-3:
         fixed_windows:
           - window: 60s
             limit: 10_000
-            unit_kind: image
+            unit_type: image

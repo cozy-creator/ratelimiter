@@ -4,15 +4,18 @@ Create tiered rate-limiting plans for your users, just like OpenAI does. Meterin
 
 First, you define usage plans; these are limits applied to each endpoint, such as 10 requests per minute + 200 requests per day + 2_000 tokens per minute. Then you assign plans to users.
 
+We only use fixed-window rate limits. You can specify whatever unit types you like in your policy: `gpu-second`, `token`, etc. and will ensure these limits are met. The default unit-type (if unspecified) is `request`.
+
+We also support `credits`, which are meant to be pre-purchased balances (either funny-money or actual dollars) that your users need in order to use your API. These credits are called `quota blocks` in postgres, and they can have expiration dates.
+
 ### Requirements
 
-- Go 1.23 or higher
 - Postgres instance
 - Redis-compatible key-value store
 
-We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis kinda sucks though, but you can use any key-value store that has a Redis-compatible API; we recommend (microsoft/Garnet)[https://github.com/microsoft/garnet] instead. Note that we use postgres-specific features in our tables, so Postgres can't be swapped out with another SQL database easily.
+We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis kinda sucks though, but you can use any key-value store that has a Redis-compatible API; we recommend [microsoft/Garnet](https://github.com/microsoft/garnet) instead. Note that we use postgres-specific features in our tables, so Postgres can't be swapped out with another SQL database easily.
 
-### Deploy locally
+### Running Locally
 
 1. Add our golang library to your project:
 
@@ -20,7 +23,7 @@ We use Postgres to store usage-plans, and Redis to store rate-limit data. Redis 
 go get github.com/cozy-creator/ratelimiter
 ```
 
-2. In this repo's root, start the postgres + docker by running:
+2. In this repo's root, start the Postgres + Garnet by using docker compose:
 
 ```bash
 docker-compose up -d
@@ -30,7 +33,7 @@ docker-compose up -d
 
 ```bash
 go run cmd/migrate/main.go
-```
+``` 
 
 ## Usage Examples
 
@@ -80,7 +83,7 @@ func main() {
 
 ```go
 // Attempt a request (consumes 1 request unit by default)
-allowed, err := client.AttemptRequest(
+allowed, info, err := client.AttemptRequest(
     ctx,
     "request-123",  // Request ID
     "user-456",     // User ID
@@ -91,13 +94,17 @@ if err != nil {
 }
 if !allowed {
     log.Println("Rate limit exceeded")
+    for unitType, window := range info {
+        log.Printf("%s: %d/%d (resets in %v)",
+            unitType, window.Remaining, window.Limit, window.Reset)
+    }
     return
 }
 
 // ... handle the request ...
 
 // End the request (just cleanup)
-result, err := client.EndRequest(ctx, "request-123")
+err = client.EndRequest(ctx, "request-123")
 if err != nil {
     log.Printf("Error ending request: %v", err)
 }
@@ -107,51 +114,67 @@ if err != nil {
 
 ```go
 // Start request with initial consumption
-allowed, err := client.AttemptRequest(
+allowed, info, err := client.AttemptRequest(
     ctx,
     "request-123",
     "user-456",
     "api/v1/chat",
-    ratelimiter.DeductTokens(10),    // Deduct tokens
-    ratelimiter.DeductCredits(5),    // Deduct credits
+    ratelimiter.DeductUnits("token", 10),    // Deduct tokens
 )
 if err != nil {
     log.Fatalf("Error: %v", err)
 }
 if !allowed {
     log.Println("Rate limit exceeded")
+    for unitType, window := range info {
+        log.Printf("%s: %d/%d (resets in %v)",
+            unitType, window.Remaining, window.Limit, window.Reset)
+    }
     return
 }
 
 // ... handle request ...
 
 // End request with final consumption
-result, err := client.EndRequest(ctx, "request-123",
-    ratelimiter.DeductTokens(100),  // Final token consumption
-    ratelimiter.DeductCredits(15),  // Final credit consumption
+err = client.EndRequest(ctx, "request-123",
+    ratelimiter.DeductUnits("token", 100),  // Final token consumption
 )
 if err != nil {
     log.Printf("Error ending request: %v", err)
     return
 }
-if result != nil && result.RemainingDue > 0 {
-    log.Printf("Warning: Could only consume %d of %d requested credits", 
-        result.Consumed, result.Requested)
+
+// Check and deduct credits
+hasBalance, err := client.HasMinBalance(ctx, "user-456", 15)
+if err != nil {
+    log.Printf("Error checking balance: %v", err)
+    return
+}
+if !hasBalance {
+    log.Printf("Insufficient credits")
+    return
+}
+
+result, err := client.DeductCredits(ctx, "user-456", 15, ratelimiter.WithRequireFullAmount(true))
+if err != nil {
+    log.Printf("Error deducting credits: %v", err)
+    return
+}
+if result.Remaining > 0 {
+    log.Printf("Warning: Could only deduct %d of %d requested credits", 
+        result.Deducted, result.Requested)
 }
 ```
 
 ### Limiter Policies
 
 Each endpoint can have multiple limiters of different types:
-- `RequestUnit`: Counts each request as 1 unit (automatically applied to every request)
-- `TokenUnit`: Counts based on token consumption (specified via WithTokens)
-- Concurrent requests are always counted per-request, if a concurrency limit is specified
+- Fixed windows with various unit types (e.g., "request", "token", "gpu-second")
+- Concurrent request limits (optional)
 
-## Plan Management
+## Plan and Account Management
 
-Plans can be defined either programmatically using Go structs or via YAML configuration files.
-
-The rate limiter supports flexible plan management through the admin package. Plans can be defined and managed in two ways:
+Plans and accounts can be managed using the admin package. This includes creating and managing plans, assigning plans to accounts, and managing quota blocks.
 
 ### 1. Using YAML Configuration (Recommended)
 
@@ -162,80 +185,25 @@ plans:
   free_tier:
     name: "Free Tier"
     endpoints:
-      "gtp-4o-mini":
+      "gpt-4-turbo":
         fixed_windows:
           - window: 60s      # Requests per minute
             limit: 3
-            unit_kind: request
+            unit_type: request
           - window: 86_400s  # Requests per day
             limit: 200
-            unit_kind: request
+            unit_type: request
           - window: 60s     # Tokens per minute
             limit: 40_000
-            unit_kind: token
+            unit_type: token
+        max_concurrent: 4
+        concurrency_expiry: 60s
 
       "dall-e-3":
         fixed_windows:
           - window: 60s   # 1 image per minute
             limit: 1
-            unit_kind: token
-
-  tier_1:
-    name: "Tier 1"
-    endpoints:
-      "gtp-4o-mini":
-        fixed_windows:
-          - window: 60s
-            limit: 500
-            unit_kind: request
-          - window: 86_400s  # Requests per day
-            limit: 10_000
-            unit_kind: request
-          - window: 60s
-            limit: 200_000
-            unit_kind: token
-      
-      "o1-preview":
-        fixed_windows:
-          - window: 60s
-            limit: 500
-            unit_kind: request
-          - window: 60s
-            limit: 30_000
-            unit_kind: token
-
-      "dall-e-3":
-        fixed_windows:
-          - window: 60s   # 500 images per minute
-            limit: 500
-            unit_kind: token
-
-  tier_2:
-    name: "Tier 2"
-    endpoints:
-      "gtp-4o-mini":
-        fixed_windows:
-          - window: 60s
-            limit: 5_000
-            unit_kind: request
-          - window: 60s
-            limit: 2_000_000
-            unit_kind: token
-      
-      "o1-preview":
-        fixed_windows:
-          - window: 60s
-            limit: 5_000
-            unit_kind: request
-          - window: 60s
-            limit: 450_000
-            unit_kind: token
-
-      "dall-e-3":
-        fixed_windows:
-          - window: 60s   # 2,500 images per minute
-            limit: 2_500
-            unit_kind: token
+            unit_type: image
 ```
 
 Load and apply the plans:
@@ -245,7 +213,6 @@ import (
     "context"
     "log"
     "github.com/cozy-creator/ratelimiter/admin"
-    "github.com/uptrace/bun"
 )
 
 func managePlans(ctx context.Context, db *bun.DB) error {
@@ -269,103 +236,32 @@ func managePlans(ctx context.Context, db *bun.DB) error {
 }
 ```
 
-### 2. Using Go Structs
-
-Plans can also be defined programmatically:
-
-```go
-import (
-    "time"
-    "github.com/cozy-creator/ratelimiter/admin"
-    "github.com/cozy-creator/ratelimiter/limiters"
-)
-
-func definePlans(ctx context.Context, db *bun.DB) error {
-    plans := admin.Plans{
-        "free_plan": {
-            Name: "Free Plan",
-            Endpoints: map[string]limiters.Policy{
-                "api/v1/chat": {
-                    SlidingWindows: []limiters.WindowLimit{
-                        {
-                            Window:   time.Minute,
-                            Limit:    100,
-                            UnitKind: limiters.RequestUnit,
-                        },
-                    },
-                    TokenBuckets: []limiters.TokenBucketLimit{
-                        {
-                            BucketSize: 1000,
-                            RefillRate: 10,
-                            UnitKind:   limiters.TokenUnit,
-                        },
-                    },
-                    MaxConcurrent: 5,
-                },
-            },
-        },
-    }
-
-    // Apply plans
-    if err := admin.ApplyPlans(ctx, db, plans); err != nil {
-        return fmt.Errorf("applying plans: %w", err)
-    }
-
-    // Set as default plan
-    return admin.SetDefaultPlan(ctx, db, "free_plan")
-}
-```
-
 ### Managing Plans and Accounts
 
-The admin package provides several functions for managing plans and accounts:
+The admin package provides functions for managing plans, accounts, and quota blocks:
 
 ```go
-// Get the current default plan
-defaultPlan, err := admin.GetDefaultPlan(ctx, db)
-if err != nil {
-    log.Printf("Error getting default plan: %v", err)
-}
+// Plan Management
+err = admin.ApplyPlans(ctx, db, plans)                    // Apply plans from config
+err = admin.SetDefaultPlan(ctx, db, "premium_plan")       // Change default plan
+err = admin.AssignPlan(ctx, db, "account-123", "premium") // Assign plan to account
+plan, err := admin.GetAccountPlan(ctx, db, "account-123") // Get account's plan
+plans, err := admin.ListPlans(ctx, db)                    // List all plans
+err = admin.DeletePlan(ctx, db, "old_plan")              // Delete unused plan
 
-// Change the default plan
-err = admin.SetDefaultPlan(ctx, db, "premium_plan")
-if err != nil {
-    log.Printf("Error setting default plan: %v", err)
-}
-
-// Assign a plan to an account
-err = admin.AssignPlan(ctx, db, "account-123", "premium_plan")
-if err != nil {
-    log.Printf("Error assigning plan: %v", err)
-}
-
-// Get current plan for an account
-plan, err := admin.GetAccountPlan(ctx, db, "account-123")
-if err != nil {
-    log.Printf("Error getting plan: %v", err)
-}
-
-// List all available plans
-plans, err := admin.ListPlans(ctx, db)
-if err != nil {
-    log.Printf("Error listing plans: %v", err)
-}
-
-// Delete a plan (will fail if it's the default plan or if accounts are using it)
-err = admin.DeletePlan(ctx, db, "old_plan")
-if err != nil {
-    log.Printf("Error deleting plan: %v", err)
-}
+// Quota Block Management
+err = admin.CreateQuotaBlock(ctx, db, "account-123", 1000, expiresAt, metadata)  // Create quota block
+err = admin.DeleteQuotaBlock(ctx, db, "block-456")                               // Delete quota block
+err = admin.ExpireQuotaBlocks(ctx, db, "account-123")                           // Expire all blocks
 ```
 
 ### Default Plan Management
 
 The system maintains exactly one default plan at all times:
-- Use `SetDefaultPlan` to change the default plan
+- Use `admin.SetDefaultPlan` to change the default plan
 - The default plan cannot be deleted while it's set as default
-- `GetDefaultPlan` always returns the current default plan
-- Accounts without a specified plan get the default plan automatically (for example, if you just want one plan to apply to all non-logged in users, who are identified with just IP-addresses)
-
+- `admin.GetDefaultPlan` always returns the current default plan
+- Accounts without a specified plan get the default plan automatically
 
 ### Endpoint Access Control
 
@@ -388,57 +284,31 @@ plans:
       # api/v1/images is not defined, so it's not accessible
 ```
 
-To grant access to a new endpoint, you must explicitly define its policy in the plan:
-```yaml
-plans:
-  premium_plan:
-    name: "Premium Plan"
-    endpoints:
-      "api/v1/chat":     # Chat API is accessible
-        sliding_windows:
-          - window: 60s
-            limit: 200
-            unit_kind: request
-      "api/v1/images":   # Image API is now accessible too
-        fixed_windows:
-          - window: 3600s
-            limit: 100
-            unit_kind: request
-```
-
 ## Rate Limit Information
 
-Applications can retrieve information about their current rate limits using the `GetRateLimitInfo` method. This is useful for displaying rate limit status to users or implementing client-side rate limiting.
+Applications can retrieve information about their current rate limits using the `GetRateLimitInfo` method:
 
 ```go
-info, err := service.GetRateLimitInfo(ctx, accountID, "api/v1/chat")
+info, err := client.GetRateLimitInfo(ctx, accountID, "api/v1/chat")
 if err != nil {
     log.Printf("Error getting rate limit info: %v", err)
     return
 }
 
-fmt.Printf("Request Limits: %d/%d (resets in %v)\n", 
-    info.RequestRemaining, info.RequestLimit, info.RequestReset)
-fmt.Printf("Token Limits: %d/%d (resets in %v)\n",
-    info.TokenRemaining, info.TokenLimit, info.TokenReset)
+for unitType, window := range info {
+    fmt.Printf("%s: %d/%d (resets in %v)\n", 
+        unitType, window.Remaining, window.Limit, window.Reset)
+}
 ```
 
 The rate limit information includes:
-- `RequestLimit`: Maximum number of requests allowed in the current window
-- `RequestRemaining`: Number of requests remaining in the current window
-- `RequestReset`: Duration until the request counter resets
-- `TokenLimit`: Maximum number of tokens allowed in the current window
-- `TokenRemaining`: Number of tokens remaining in the current window
-- `TokenReset`: Duration until the token counter resets
+- For each unit type (e.g., "request", "token", "gpu-second"):
+  - Limit: maximum units allowed in the window
+  - Remaining: units remaining in the window
+  - Reset: time until the window resets
+- If concurrency limits are enabled, includes a "concurrent" entry with:
+  - Limit: maximum concurrent requests
+  - Remaining: remaining concurrent request slots
+  - Reset: time until request is no longer counted as concurrent
 
-This information is also included in HTTP response headers when using the HTTP middleware:
-```
-X-RateLimit-Limit-Requests: 100
-X-RateLimit-Remaining-Requests: 95
-X-RateLimit-Reset-Requests: 55
-X-RateLimit-Limit-Tokens: 40000
-X-RateLimit-Remaining-Tokens: 38500
-X-RateLimit-Reset-Tokens: 3540
-```
-
-The reset times are provided in seconds. A value of 0 indicates that the limit has already reset.
+This information is also could be included in the HTTP response headers like OpenAI does, if you want to be helpful to your API-consumers.

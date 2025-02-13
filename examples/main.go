@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/ratelimiter"
 	"github.com/cozy-creator/ratelimiter/admin"
 	"github.com/cozy-creator/ratelimiter/limiters"
+	"github.com/cozy-creator/ratelimiter/models"
 	"github.com/google/uuid"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -79,17 +80,14 @@ func RunStressTest() {
 		},
 	}
 
-	// Apply plans
-	if err := client.SetPlan(ctx, "free_tier", "Free Tier", plans["free_tier"].Endpoints); err != nil {
-		log.Fatalf("setting free tier plan: %v", err)
-	}
-	if err := client.SetPlan(ctx, "premium_tier", "Premium Tier", plans["premium_tier"].Endpoints); err != nil {
-		log.Fatalf("setting premium tier plan: %v", err)
+	// Apply plans using admin package
+	if err := admin.ApplyPlans(ctx, client.DB(), plans); err != nil {
+		log.Fatalf("applying plans: %v", err)
 	}
 
-	// Set free tier as default plan
-	if err := client.SetDefaultPlan(ctx, "free_tier"); err != nil {
-		log.Fatalf("unable to set default plan: %v", err)
+	// Set free tier as default plan using admin package
+	if err := admin.SetDefaultPlan(ctx, client.DB(), "free_tier"); err != nil {
+		log.Fatalf("setting default plan: %v", err)
 	}
 
 	// Create test users with their plans and initial quota blocks
@@ -109,15 +107,22 @@ func RunStressTest() {
 		log.Printf("User %s: %s plan", user.id, user.planID)
 	}
 
-	// Create accounts and assign plans
+	// Create accounts and assign plans using admin package
 	for _, user := range users {
-		// Create account with plan
-		if err := client.CreateAccount(ctx, user.id, user.planID); err != nil {
+		// Create account with plan using admin package
+		account := &models.Account{
+			ID:     user.id,
+			PlanID: user.planID,
+		}
+		_, err := client.DB().NewInsert().
+			Model(account).
+			Exec(ctx)
+		if err != nil {
 			log.Fatalf("creating account for %s: %v", user.id, err)
 		}
 
 		// Expire any existing quota blocks
-		if err := client.ExpireQuotaBlocks(ctx, user.id); err != nil {
+		if err := admin.ExpireQuotaBlocks(ctx, client.DB(), user.id); err != nil {
 			log.Fatalf("expiring old quota blocks for %s: %v", user.id, err)
 		}
 
@@ -155,7 +160,7 @@ func RunStressTest() {
 				log.Fatalf("marshaling metadata for %s: %v", user.id, err)
 			}
 
-			if err := client.CreateQuotaBlock(ctx, user.id, credits, expiresAt, metadata); err != nil {
+			if err := admin.CreateQuotaBlock(ctx, client.DB(), user.id, credits, expiresAt, metadata); err != nil {
 				log.Fatalf("creating quota block for %s: %v", user.id, err)
 			}
 		}
